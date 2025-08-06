@@ -1,0 +1,179 @@
+from fastapi import FastAPI, Depends, HTTPException, status
+from sqlalchemy import Column, String, Integer, create_engine
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from pydantic import BaseModel, EmailStr
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from datetime import datetime, timedelta
+from typing import Optional
+import uuid
+
+# ========================
+# 🗂 Config
+# ========================
+SECRET_KEY = "your_secret_key_here"  # Change this in production
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# ========================
+# 🔐 Password Hashing
+# ========================
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+# ========================
+# 🛠 Database Setup
+# ========================
+DATABASE_URL = "sqlite:///./users.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+# ========================
+# 🗃 Models
+# ========================
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
+    name = Column(String, nullable=False)
+    email = Column(String, unique=True, nullable=False, index=True)
+    hashed_password = Column(String, nullable=False)
+    role = Column(String, default="user")  # Roles: admin, user, owner
+    age = Column(Integer, nullable=True)
+
+Base.metadata.create_all(bind=engine)
+
+# ========================
+# 📝 Schemas
+# ========================
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+    password: str
+    age: Optional[int] = None
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+# ========================
+# 🔑 JWT Utility
+# ========================
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ========================
+# 🆔 Get Current User
+# ========================
+from fastapi.security import OAuth2PasswordBearer
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if user is None:
+        raise credentials_exception
+    return user
+
+# ========================
+# ⛔ Role Checker Dependency
+# ========================
+def role_required(required_role: str):
+    def role_checker(user: User = Depends(get_current_user)):
+        if user.role != required_role:
+            raise HTTPException(status_code=403, detail="Not authorized")
+        return user
+    return role_checker
+
+# ========================
+# 🚀 FastAPI App
+# ========================
+app = FastAPI()
+
+# ========================
+# 📥 Routes
+# ========================
+
+# Register User
+@app.post("/register")
+def register(user: UserCreate, db: Session = Depends(get_db)):
+    existing_user = db.query(User).filter(User.email == user.email).first()
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    hashed_pwd = hash_password(user.password)
+    db_user = User(
+        name=user.name,
+        email=user.email,
+        hashed_password=hashed_pwd,
+        age=user.age
+    )
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+    return {"message": "User created successfully"}
+
+# Login User → Get JWT
+@app.post("/login", response_model=Token)
+def login(user: UserLogin, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == user.email).first()
+    if not db_user or not verify_password(user.password, db_user.hashed_password):
+        raise HTTPException(status_code=400, detail="Invalid credentials")
+
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": db_user.id, "role": db_user.role},
+        expires_delta=access_token_expires
+    )
+    return {"access_token": access_token, "token_type": "bearer"}
+
+# Protected Route (Any Authenticated User)
+@app.get("/profile")
+def read_profile(current_user: User = Depends(get_current_user)):
+    return {
+        "name": current_user.name,
+        "email": current_user.email,
+        "role": current_user.role,
+        "age": current_user.age
+    }
+
+# Protected Route (Admin Only)
+@app.get("/admin/dashboard")
+def admin_dashboard(current_user: User = Depends(role_required("admin"))):
+    return {"message": f"Welcome Admin {current_user.name}!"}
