@@ -1,0 +1,148 @@
+from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel, EmailStr
+from jose import JWTError, jwt
+from sqlalchemy import create_engine, Column, Integer, String, Date, ForeignKey, Boolean
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker, Session, relationship
+from passlib.hash import bcrypt
+from datetime import datetime, timedelta
+import uuid
+
+# CONFIG
+SECRET_KEY = "secret123"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+# DB Setup (Use PostgreSQL in real projects)
+SQLALCHEMY_DATABASE_URL = "sqlite:///./hotel.db"
+engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False)
+Base = declarative_base()
+
+# MODELS
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True)
+    hashed_password = Column(String)
+    is_admin = Column(Boolean, default=False)
+
+class HotelRoom(Base):
+    __tablename__ = "rooms"
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String)
+    description = Column(String)
+    owner_id = Column(Integer, ForeignKey('users.id'))
+    price = Column(Integer)
+
+class Booking(Base):
+    __tablename__ = "bookings"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey('users.id'))
+    room_id = Column(Integer, ForeignKey('rooms.id'))
+    check_in = Column(Date)
+    check_out = Column(Date)
+
+Base.metadata.create_all(bind=engine)
+
+# SCHEMAS
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class RoomCreate(BaseModel):
+    name: str
+    description: str
+    price: int
+
+class BookingCreate(BaseModel):
+    room_id: int
+    check_in: datetime
+    check_out: datetime
+
+# AUTH
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + (expires_delta or timedelta(minutes=15))
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_user(db, email: str):
+    return db.query(User).filter(User.email == email).first()
+
+def verify_password(plain, hashed):
+    return bcrypt.verify(plain, hashed)
+
+def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(SessionLocal)):
+    credentials_exception = HTTPException(status_code=401, detail="Invalid token", headers={"WWW-Authenticate": "Bearer"})
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if email is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = get_user(db, email)
+    if user is None:
+        raise credentials_exception
+    return user
+
+# APP
+app = FastAPI()
+
+# ROUTES
+@app.post("/register")
+def register(user: UserCreate, db: Session = Depends(SessionLocal)):
+    db_user = get_user(db, user.email)
+    if db_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+    hashed_pw = bcrypt.hash(user.password)
+    new_user = User(email=user.email, hashed_password=hashed_pw)
+    db.add(new_user)
+    db.commit()
+    db.refresh(new_user)
+    return {"msg": "User created successfully"}
+
+@app.post("/token", response_model=Token)
+def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(SessionLocal)):
+    user = get_user(db, form_data.username)
+    if not user or not verify_password(form_data.password, user.hashed_password):
+        raise HTTPException(status_code=400, detail="Incorrect credentials")
+    access_token = create_access_token(data={"sub": user.email})
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/rooms")
+def create_room(room: RoomCreate, db: Session = Depends(SessionLocal), user: User = Depends(get_current_user)):
+    db_room = HotelRoom(name=room.name, description=room.description, price=room.price, owner_id=user.id)
+    db.add(db_room)
+    db.commit()
+    return {"msg": "Room created"}
+
+@app.get("/rooms")
+def list_rooms(db: Session = Depends(SessionLocal)):
+    return db.query(HotelRoom).all()
+
+@app.post("/book")
+def book_room(booking: BookingCreate, db: Session = Depends(SessionLocal), user: User = Depends(get_current_user)):
+    # Check room exists
+    room = db.query(HotelRoom).filter(HotelRoom.id == booking.room_id).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    # Save booking
+    new_booking = Booking(
+        user_id=user.id,
+        room_id=booking.room_id,
+        check_in=booking.check_in,
+        check_out=booking.check_out
+    )
+    db.add(new_booking)
+    db.commit()
+    return {"msg": "Room booked"}
+
