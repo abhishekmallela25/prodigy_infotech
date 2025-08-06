@@ -1,0 +1,134 @@
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy import create_engine, Column, String, Integer
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+from pydantic import BaseModel, EmailStr
+from uuid import uuid4, UUID
+import redis
+import json
+import os
+
+# ==========================
+# 🔌 Redis Setup
+# ==========================
+r = redis.Redis(host='localhost', port=6379, db=0, decode_responses=True)
+
+# ==========================
+# 🛠 SQLAlchemy Setup
+# ==========================
+DATABASE_URL = "sqlite:///./users.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+Base = declarative_base()
+
+# ==========================
+# 👤 User Model
+# ==========================
+class User(Base):
+    __tablename__ = "users"
+    id = Column(String, primary_key=True, default=lambda: str(uuid4()))
+    name = Column(String, nullable=False)
+    email = Column(String, nullable=False, unique=True)
+    age = Column(Integer, nullable=False)
+
+Base.metadata.create_all(bind=engine)
+
+# ==========================
+# 📥 Pydantic Schemas
+# ==========================
+class UserCreate(BaseModel):
+    name: str
+    email: EmailStr
+    age: int
+
+class UserResponse(UserCreate):
+    id: UUID
+
+    class Config:
+        orm_mode = True
+
+# ==========================
+# 💾 Database Dependency
+# ==========================
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# ==========================
+# 🚀 FastAPI App
+# ==========================
+app = FastAPI()
+
+# ==========================
+# 🔍 Get All Users with Redis Caching
+# ==========================
+@app.get("/users", response_model=list[UserResponse])
+def get_users(db: Session = Depends(get_db)):
+    # Check Redis cache
+    cached_users = r.get("users")
+    if cached_users:
+        return json.loads(cached_users)
+
+    # Fetch from DB
+    users = db.query(User).all()
+    user_data = [UserResponse.from_orm(user).dict() for user in users]
+
+    # Store in cache for 60 seconds
+    r.set("users", json.dumps(user_data), ex=60)
+
+    return user_data
+
+# ==========================
+# ➕ Create User + Invalidate Cache
+# ==========================
+@app.post("/users", response_model=UserResponse)
+def create_user(user: UserCreate, db: Session = Depends(get_db)):
+    db_user = User(name=user.name, email=user.email, age=user.age)
+    db.add(db_user)
+    db.commit()
+    db.refresh(db_user)
+
+    # Invalidate cache
+    r.delete("users")
+
+    return db_user
+
+# ==========================
+# ✏️ Update User + Invalidate Cache
+# ==========================
+@app.put("/users/{user_id}", response_model=UserResponse)
+def update_user(user_id: UUID, user: UserCreate, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.id == str(user_id)).first()
+    if not db_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    db_user.name = user.name
+    db_user.email = user.email
+    db_user.age = user.age
+    db.commit()
+    db.refresh(db_user)
+
+    # Invalidate cache
+    r.delete("users")
+
+    return db_user
+
+# ==========================
+# ❌ Delete User + Invalidate Cache
+# ==========================
+@app.delete("/users/{user_id}")
+def delete_user(user_id: UUID, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.id == str(user_id)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    db.delete(user)
+    db.commit()
+
+    # Invalidate cache
+    r.delete("users")
+
+    return {"message": "User deleted successfully"}
